@@ -6,6 +6,7 @@ from PIL import Image
 import torch
 import argparse
 from sklearn.metrics import f1_score
+import time
 
 # 学生ID（需要替换）
 STUDENT_ID = "PB23000243"
