@@ -4,6 +4,8 @@ import argparse
 from utils import load_data, handle_class_imbalance, train_val_split
 from model import NeuralNetwork
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rc("font", family='Microsoft YaHei')
 from sklearn.metrics import precision_score, recall_score, f1_score
 import gc
 import time

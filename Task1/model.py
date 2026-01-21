@@ -248,7 +248,7 @@ class NeuralNetwork:
 
     def load_model(self, filename):
         """加载模型参数"""
-        model_params = torch.load(filename)
+        model_params = torch.load(filename, weights_only=False)
         self.weights = model_params['weights']
         self.biases = model_params['biases']
         self.layer_sizes = model_params['layer_sizes']
