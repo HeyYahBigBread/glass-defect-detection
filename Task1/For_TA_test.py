@@ -104,7 +104,7 @@ class NeuralNetwork:
 
     def load_model(self, filename):
         """加载模型参数"""
-        model_params = torch.load(filename, map_location='cpu')
+        model_params = torch.load(filename, map_location='cpu', weights_only=False)
         self.weights = model_params['weights']
         self.biases = model_params['biases']
         self.layer_sizes = model_params['layer_sizes']
@@ -148,7 +148,7 @@ def main():
 
     # 预测
     y_pred = model.predict(X_test)
-    y_pred_classes = (y_pred >= 0.5).astype(int)
+    y_pred_classes = (y_pred >= 0.4).astype(int)
 
     # 计算F1分数
     f1 = f1_score(y_true, y_pred_classes)
@@ -158,7 +158,7 @@ def main():
     elapsed_time = end_time - start_time
 
     print(f"{STUDENT_ID}:{f1:.4f}")
-    print(f"评估完成，共处理 {len(img_files)} 个图像，耗时 {elapsed_time:.2f} 秒", file=sys.stderr)
+    #print(f"评估完成，共处理 {len(img_files)} 个图像，耗时 {elapsed_time:.2f} 秒", file=sys.stderr)
 
 
 if __name__ == "__main__":

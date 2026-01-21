@@ -20,23 +20,22 @@ def main():
     X, y = load_data(args.data_path)
     print(f"加载了 {len(X)} 个样本，特征维度: {X.shape[1]}")
 
-    # 处理类不平衡
-    print("处理类不平衡...")
-    X_balanced, y_balanced = handle_class_imbalance(X, y)
-    print(f"平衡后的样本数量: {len(X_balanced)}")
+    # 1. 先切分原始数据
+    X_train_raw, X_val, y_train_raw, y_val = train_val_split(X, y)
 
-    # 划分训练集和验证集
-    X_train, X_val, y_train, y_val = train_val_split(X_balanced, y_balanced)
-    print(f"训练集: {len(X_train)}, 验证集: {len(X_val)}")
+    # 2. 只对训练集进行过采样（平衡）
+    X_train, y_train = handle_class_imbalance(X_train_raw, y_train_raw)
+
+    print(f"训练集(平衡后): {len(X_train)}, 验证集(纯净): {len(X_val)}")
 
     # 初始化模型
     input_size = X_train.shape[1]
     model = NeuralNetwork(
         input_size=input_size,
-        hidden_sizes=[128, 64],
+        hidden_sizes=[512, 256],
         output_size=1,
         learning_rate=0.001,
-        momentum=0.9
+        momentum=0.93
     )
 
     # 训练模型
@@ -87,7 +86,8 @@ def main():
     print("训练历史已保存到 training_history.png")
 
     # 释放内存
-    del X, y, X_balanced, y_balanced, X_train, y_train, X_val, y_val
+    # 去掉中间那两个已经不存在的变量
+    del X, y, X_train, y_train, X_val, y_val
     gc.collect()
 
 

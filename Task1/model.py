@@ -138,6 +138,7 @@ class NeuralNetwork:
         """计算二元交叉熵损失"""
         # 防止数值不稳定
         y_pred = np.clip(y_pred, 1e-7, 1 - 1e-7)
+        y_true = y_true.reshape(-1, 1)
 
         # 二元交叉熵
         loss = -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
