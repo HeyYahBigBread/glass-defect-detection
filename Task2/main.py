@@ -12,6 +12,8 @@ from sklearn.metrics import f1_score
 import argparse
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rc("font", family='Microsoft YaHei')
 import time
 import copy
 
