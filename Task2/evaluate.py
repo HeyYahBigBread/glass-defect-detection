@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from sklearn.metrics import f1_score, classification_report
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rc("font", family='Microsoft YaHei')
 from tqdm import tqdm
 import time
 
