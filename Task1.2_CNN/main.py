@@ -5,16 +5,19 @@ import numpy as np
 import cv2
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, precision_score, recall_score
 
 # --- 配置 ---
-IMG_SIZE = 128   # CNN 可以处理大图，保留更多细节
+IMG_SIZE = 128   # 保持128平衡速度与精度
 BATCH_SIZE = 32
-LR = 0.001       # 学习率
-EPOCHS = 40
+LR = 0.001
+EPOCHS = 50
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# --- 1. 手动实现的卷积层 (基于 im2col 加速) ---
+# ==============================================================================
+# 1. 基础算子 (无 Autograd)
+# ==============================================================================
 class ManualConv2d:
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         self.in_channels = in_channels
@@ -22,145 +25,77 @@ class ManualConv2d:
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-        
-        # Kaiming Initialization
+        # He Initialization
         n = in_channels * kernel_size * kernel_size
-        stdv = 1. / np.sqrt(n)
-        self.W = torch.FloatTensor(out_channels, in_channels * kernel_size * kernel_size).uniform_(-stdv, stdv).to(DEVICE)
+        stdv = np.sqrt(2. / n)
+        self.W = torch.randn(out_channels, n).to(DEVICE) * stdv
         self.b = torch.zeros(1, out_channels).to(DEVICE)
-        
-        # Adam 缓存
         self.m_W, self.v_W = torch.zeros_like(self.W), torch.zeros_like(self.W)
         self.m_b, self.v_b = torch.zeros_like(self.b), torch.zeros_like(self.b)
         self.t = 0
-        
-        # 中间变量缓存
-        self.input_shape = None
-        self.x_col = None
 
     def forward(self, x):
-        # x shape: (N, C, H, W)
         self.input_shape = x.shape
         N, C, H, W = x.shape
-        
-        # 计算输出尺寸
         H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
         W_out = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
-        
-        # 1. im2col: 将图片块展平成列
-        # 使用 F.unfold (在白名单中) 实现高效展平
-        # x_unfold shape: (N, C*K*K, H_out*W_out)
         inp_unf = F.unfold(x, (self.kernel_size, self.kernel_size), padding=self.padding, stride=self.stride)
-        
-        # 2. 矩阵乘法
-        # W shape: (Out_C, In_C*K*K)
-        # 我们需要 W @ x_col
-        # 为了 Batch 计算，我们将 inp_unf 转置为: (N, H_out*W_out, C*K*K) -> 合并 Batch -> (N*H_out*W_out, C*K*K)
-        # 但更简单的是：(N, C_in*K*K, L) -> permute -> (N, L, C_in*K*K)
-        
-        self.x_col = inp_unf # 缓存用于反向传播 (N, Cin*K*K, L)
-        
-        # 执行卷积: Out = W * X_col + b
-        # (Out_C, Cin*K*K) @ (N, Cin*K*K, L) -> 这一步需要广播
-        # 我们可以利用 transpose 做： (N, L, Cin*K*K) @ W.t() -> (N, L, Out_C)
-        
-        out = inp_unf.transpose(1, 2).matmul(self.W.t()) # (N, L, Out_C)
-        out += self.b # 广播加偏置
-        
-        # Reshape 回图片格式 (N, Out_C, H_out, W_out)
-        out = out.transpose(1, 2).view(N, self.out_channels, H_out, W_out)
+        self.x_col = inp_unf 
+        out = inp_unf.transpose(1, 2).matmul(self.W.t()) + self.b 
+        out = out.transpose(1, 2).reshape(N, self.out_channels, H_out, W_out)
         return out
 
     def backward(self, grad_output):
-        # grad_output: (N, Out_C, H_out, W_out)
         N, Out_C, H_out, W_out = grad_output.shape
-        
-        # 1. 准备梯度
-        # Reshape grad: (N, Out_C, L) where L = H_out*W_out
-        grad_out_flat = grad_output.view(N, Out_C, -1)
-        
-        # 2. 计算 dW
-        # dW = grad_out * x_col^T
-        # Sum over batch: (Out_C, L) @ (L, Cin*K*K) ??? No.
-        # 正确公式: dW = sum_over_batch( grad_out_n @ x_col_n.T )
-        # grad_out_flat: (N, Out_C, L)
-        # x_col: (N, Cin*K*K, L)
-        # result: (N, Out_C, Cin*K*K) -> sum(0)
-        
+        grad_out_flat = grad_output.reshape(N, Out_C, -1)
         self.dW = grad_out_flat.matmul(self.x_col.transpose(1, 2)).sum(dim=0)
-        self.db = grad_out_flat.sum(dim=(0, 2)).unsqueeze(0) # sum over N and L
-        
-        # 3. 计算 dx (输入梯度)
-        # dx_col = W^T * grad_out
-        # (Cin*K*K, Out_C) @ (N, Out_C, L) -> (N, Cin*K*K, L)
+        self.db = grad_out_flat.sum(dim=(0, 2)).unsqueeze(0)
         grad_x_col = self.W.t().matmul(grad_out_flat)
-        
-        # 4. col2im: 将列恢复为图片梯度
-        # 使用 F.fold
         grad_x = F.fold(grad_x_col, output_size=(self.input_shape[2], self.input_shape[3]), 
                         kernel_size=(self.kernel_size, self.kernel_size), 
                         padding=self.padding, stride=self.stride)
-        
         return grad_x
 
     def step(self, lr):
         self.t += 1
         beta1, beta2, eps = 0.9, 0.999, 1e-8
-        
-        # Adam update for W
         self.m_W = beta1 * self.m_W + (1 - beta1) * self.dW
         self.v_W = beta2 * self.v_W + (1 - beta2) * (self.dW**2)
         m_hat = self.m_W / (1 - beta1**self.t)
         v_hat = self.v_W / (1 - beta2**self.t)
         self.W -= lr * m_hat / (torch.sqrt(v_hat) + eps)
-        
-        # Adam update for b
         self.m_b = beta1 * self.m_b + (1 - beta1) * self.db
         self.v_b = beta2 * self.v_b + (1 - beta2) * (self.db**2)
         m_hat_b = self.m_b / (1 - beta1**self.t)
         v_hat_b = self.v_b / (1 - beta2**self.t)
         self.b -= lr * m_hat_b / (torch.sqrt(v_hat_b) + eps)
 
-# --- 2. 手动池化层 ---
 class ManualMaxPool2d:
     def __init__(self, kernel_size=2, stride=2):
         self.kernel_size = kernel_size
         self.stride = stride
-        self.indices = None
-        self.input_shape = None
-
     def forward(self, x):
         self.input_shape = x.shape
-        # 使用 return_indices=True 来辅助反向传播
-        out, indices = F.max_pool2d(x, self.kernel_size, self.stride, return_indices=True)
-        self.indices = indices
+        out, self.indices = F.max_pool2d(x, self.kernel_size, self.stride, return_indices=True)
         return out
-
     def backward(self, grad_output):
-        # 使用 F.max_unpool2d 利用之前记录的 indices 恢复梯度
-        grad_input = F.max_unpool2d(grad_output, self.indices, self.kernel_size, self.stride, output_size=self.input_shape)
-        return grad_input
+        return F.max_unpool2d(grad_output, self.indices, self.kernel_size, self.stride, output_size=self.input_shape)
 
-# --- 3. 辅助层 ---
 class ManualFlatten:
-    def __init__(self):
-        self.input_shape = None
     def forward(self, x):
         self.input_shape = x.shape
-        return x.view(x.shape[0], -1)
+        return x.reshape(x.shape[0], -1) 
     def backward(self, grad_output):
-        return grad_output.view(self.input_shape)
+        return grad_output.reshape(self.input_shape)
 
 class ManualReLU:
-    def __init__(self):
-        self.mask = None
     def forward(self, x):
         self.mask = (x > 0).float()
         return x * self.mask
     def backward(self, grad_output):
         return grad_output * self.mask
 
-class ManualLinear: # (和之前一样，为了完整性保留)
+class ManualLinear:
     def __init__(self, in_features, out_features):
         std = np.sqrt(2.0 / in_features)
         self.W = torch.randn(in_features, out_features).to(DEVICE) * std
@@ -168,7 +103,6 @@ class ManualLinear: # (和之前一样，为了完整性保留)
         self.m_W, self.v_W = torch.zeros_like(self.W), torch.zeros_like(self.W)
         self.m_b, self.v_b = torch.zeros_like(self.b), torch.zeros_like(self.b)
         self.t = 0
-        self.input = None
     def forward(self, x):
         self.input = x
         return x.mm(self.W) + self.b
@@ -191,189 +125,235 @@ class ManualLinear: # (和之前一样，为了完整性保留)
         self.b -= lr * m_hat_b / (torch.sqrt(v_hat_b) + eps)
 
 class ManualSigmoid:
-    def __init__(self):
-        self.out = None
     def forward(self, x):
         self.out = 1.0 / (1.0 + torch.exp(-torch.clamp(x, -50, 50)))
         return self.out
     def backward(self, grad_output):
         return grad_output * self.out * (1.0 - self.out)
 
-# --- 4. CNN 模型整合 ---
+# ==============================================================================
+# 2. 轻量级 CNN (3层卷积)
+# ==============================================================================
 class CNN:
     def __init__(self):
-        # 输入: (1, 128, 128)
         self.layers = [
-            # Conv1: 1 -> 8, 5x5
-            ManualConv2d(1, 8, kernel_size=5, stride=1, padding=2), # (8, 128, 128)
-            ManualReLU(),
-            ManualMaxPool2d(2, 2), # (8, 64, 64)
-            
-            # Conv2: 8 -> 16, 3x3
-            ManualConv2d(8, 16, kernel_size=3, stride=1, padding=1), # (16, 64, 64)
-            ManualReLU(),
-            ManualMaxPool2d(2, 2), # (16, 32, 32)
-            
-            # Conv3: 16 -> 32, 3x3
-            ManualConv2d(16, 32, kernel_size=3, stride=1, padding=1), # (32, 32, 32)
-            ManualReLU(),
-            ManualMaxPool2d(2, 2), # (32, 16, 16)
+            # Conv1: 1 -> 8
+            ManualConv2d(1, 8, kernel_size=5, stride=1, padding=2), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Conv2: 8 -> 16
+            ManualConv2d(8, 16, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Conv3: 16 -> 32
+            ManualConv2d(16, 32, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
             
             ManualFlatten(),
-            # Linear: 32 * 16 * 16 = 8192
-            ManualLinear(32 * 16 * 16, 128),
-            ManualReLU(),
-            ManualLinear(128, 1),
-            ManualSigmoid()
+            # Linear: 32 * 16 * 16 = 8192 (For 128x128 input)
+            ManualLinear(32 * 16 * 16, 128), ManualReLU(),
+            ManualLinear(128, 1), ManualSigmoid()
         ]
 
     def forward(self, x):
         out = x
-        for layer in self.layers:
-            out = layer.forward(out)
+        for layer in self.layers: out = layer.forward(out)
         return out
-
     def backward(self, grad_loss):
         grad = grad_loss
-        for layer in reversed(self.layers):
-            grad = layer.backward(grad)
-
+        for layer in reversed(self.layers): grad = layer.backward(grad)
     def step(self, lr):
-        for layer in self.layers:
-            if hasattr(layer, 'step'):
-                layer.step(lr)
-                
+        for layer in self.layers: 
+            if hasattr(layer, 'step'): layer.step(lr)
     def save(self, path):
-        # 保存所有 ManualConv2d 和 ManualLinear 的参数
         checkpoint = {}
         for i, layer in enumerate(self.layers):
             if isinstance(layer, (ManualConv2d, ManualLinear)):
-                checkpoint[f'{i}_W'] = layer.W.cpu()
-                checkpoint[f'{i}_b'] = layer.b.cpu()
+                checkpoint[f'{i}_W'] = layer.W.cpu(); checkpoint[f'{i}_b'] = layer.b.cpu()
         torch.save(checkpoint, path)
-
     def load(self, path):
         checkpoint = torch.load(path, map_location=DEVICE)
         for i, layer in enumerate(self.layers):
             if isinstance(layer, (ManualConv2d, ManualLinear)):
-                layer.W = checkpoint[f'{i}_W'].to(DEVICE)
-                layer.b = checkpoint[f'{i}_b'].to(DEVICE)
+                layer.W = checkpoint[f'{i}_W'].to(DEVICE); layer.b = checkpoint[f'{i}_b'].to(DEVICE)
 
-# --- 5. 数据加载 (解决类别不平衡) ---
-def get_balanced_batch_cnn(img_paths, txt_dir, batch_size):
-    # 实时读取图片，不占内存
-    # 随机选择一半正样本，一半负样本
-    
-    # 预先扫描所有样本的标签（只做一次）
-    if not hasattr(get_balanced_batch_cnn, 'pos_paths'):
-        pos_paths = []
-        neg_paths = []
+# ==============================================================================
+# 3. 安全的数据加载器 (Class-based, Zero Leakage)
+# ==============================================================================
+class GlassDataLoader:
+    def __init__(self, img_paths, txt_dir, name="Loader"):
+        """
+        初始化时就完成数据扫描和分类，保证训练集和验证集互不干扰。
+        """
+        self.name = name
+        self.pos_paths = []
+        self.neg_paths = []
+        
+        # 扫描路径
         for p in img_paths:
             base = os.path.basename(p).replace('.png', '')
             if os.path.exists(os.path.join(txt_dir, base + '.txt')):
-                pos_paths.append(p)
+                self.pos_paths.append(p)
             else:
-                neg_paths.append(p)
-        get_balanced_batch_cnn.pos_paths = pos_paths
-        get_balanced_batch_cnn.neg_paths = neg_paths
-        print(f"Dataset stats: {len(pos_paths)} Defective, {len(neg_paths)} Good")
-
-    pos_batch_paths = np.random.choice(get_balanced_batch_cnn.pos_paths, batch_size // 2)
-    neg_batch_paths = np.random.choice(get_balanced_batch_cnn.neg_paths, batch_size - (batch_size // 2))
-    batch_paths = np.concatenate([pos_batch_paths, neg_batch_paths])
-    np.random.shuffle(batch_paths)
-
-    images = []
-    labels = []
-    
-    for p in batch_paths:
-        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-        img = img.astype(np.float32) / 255.0
-        # CNN 输入需要 (C, H, W)
-        images.append(img[np.newaxis, :, :]) 
+                self.neg_paths.append(p)
         
-        base = os.path.basename(p).replace('.png', '')
-        label = 1.0 if os.path.exists(os.path.join(txt_dir, base + '.txt')) else 0.0
-        labels.append(label)
-        
-    return torch.tensor(np.array(images)).float().to(DEVICE), \
-           torch.tensor(np.array(labels)).float().view(-1, 1).to(DEVICE)
+        print(f"[{self.name}] Stats: {len(self.pos_paths)} Defective, {len(self.neg_paths)} Good")
 
-# --- 6. 主训练循环 ---
+    def get_batch(self, batch_size, augment=False):
+        """
+        获取一个平衡采样的 Batch。
+        augment=True: 训练模式，启用随机翻转/旋转
+        augment=False: 验证模式，禁用增强，只做缩放和归一化
+        """
+        # 平衡采样: 50% 正样本, 50% 负样本
+        n_pos = batch_size // 2
+        n_neg = batch_size - n_pos
+        
+        # 随机抽取路径
+        # 注意：如果是验证集，这里虽然是随机抽，但因为augment=False，
+        # 我们评估的是模型对这批样本的“原始形态”的判断能力，这是合理的。
+        pos_batch = np.random.choice(self.pos_paths, n_pos)
+        neg_batch = np.random.choice(self.neg_paths, n_neg)
+        batch_paths = np.concatenate([pos_batch, neg_batch])
+        np.random.shuffle(batch_paths)
+
+        images, labels = [], []
+        for p in batch_paths:
+            # 读取
+            raw = np.fromfile(p, dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            img = img.astype(np.float32) / 255.0
+            
+            # --- 数据增强 (仅当 augment=True 时触发) ---
+            if augment:
+                # 随机水平翻转
+                if np.random.rand() > 0.5:
+                    img = np.flip(img, axis=1)
+                # 随机垂直翻转
+                if np.random.rand() > 0.5:
+                    img = np.flip(img, axis=0)
+                # 随机旋转 (90度倍数)
+                k = np.random.randint(0, 4)
+                if k > 0:
+                    img = np.rot90(img, k)
+            
+            # 解决内存不连续警告
+            images.append(img[np.newaxis, :, :].copy()) 
+            
+            # 标签
+            # 实际上我们在init里已经分好类了，可以直接判断 p 在不在 pos_paths 里，
+            # 但为了简单，这里复用路径判断
+            if p in self.pos_paths:
+                labels.append(1.0)
+            else:
+                labels.append(0.0)
+            
+        return torch.tensor(np.array(images)).float().to(DEVICE), \
+               torch.tensor(np.array(labels)).float().view(-1, 1).to(DEVICE)
+
+# ==============================================================================
+# 4. 训练循环 (含绘图)
+# ==============================================================================
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='../dataset/train')
     args = parser.parse_args()
     
+    # 路径检查
     img_dir = os.path.join(args.data_path, 'img')
     txt_dir = os.path.join(args.data_path, 'txt')
-    all_img_paths = glob.glob(os.path.join(img_dir, '*.png'))
+    all_paths = glob.glob(os.path.join(img_dir, '*.png'))
+    if not all_paths: print("Error: No images found!"); return
+
+    # --- 1. 严格切分数据集 (先切分，再给 Loader) ---
+    np.random.shuffle(all_paths) # 打乱顺序
+    split = int(0.8 * len(all_paths))
+    train_paths = all_paths[:split]
+    val_paths = all_paths[split:]
     
-    # 初始化
+    print(f"Total images: {len(all_paths)}. Split: {len(train_paths)} Train, {len(val_paths)} Val.")
+
+    # --- 2. 初始化完全独立的 Loader ---
+    train_loader = GlassDataLoader(train_paths, txt_dir, name="Train")
+    val_loader = GlassDataLoader(val_paths, txt_dir, name="Val")
+    
     model = CNN()
-    print(f"Model initialized on {DEVICE}. Training CNN...")
+    print(f"Start Training (Safe Split & Augmentation) on {DEVICE}...")
     
-    # 简单的 Train/Val split (取最后20%做验证)
-    split = int(0.8 * len(all_img_paths))
-    train_paths = all_img_paths[:split]
-    val_paths = all_img_paths[split:]
-    
+    # 策略参数
     best_f1 = 0.0
-    steps = len(train_paths) // BATCH_SIZE
+    patience, pat_cnt = 8, 0
+    lr, lr_pat, lr_cnt = LR, 3, 0
+    
+    history = {'loss': [], 'val_f1': [], 'val_precision': [], 'val_recall': []}
     
     for epoch in range(EPOCHS):
-        total_loss = 0
-        
-        # Training
+        # --- 训练阶段 (augment=True) ---
+        steps = len(train_paths) // BATCH_SIZE
+        loss_sum = 0
         for _ in range(steps):
-            bx, by = get_balanced_batch_cnn(train_paths, txt_dir, BATCH_SIZE)
-            
-            # Forward
+            bx, by = train_loader.get_batch(BATCH_SIZE, augment=True) # 开启增强
             out = model.forward(bx)
+            out = torch.clamp(out, 1e-7, 1-1e-7)
+            loss = -(by * torch.log(out) + (1-by) * torch.log(1-out)).mean()
             
-            # Loss (BCE)
-            out = torch.clamp(out, 1e-7, 1 - 1e-7)
-            loss = - (by * torch.log(out) + (1 - by) * torch.log(1 - out)).mean()
-            
-            # Backward
-            grad_out = - (by / out - (1 - by) / (1 - out)) / BATCH_SIZE
-            model.backward(grad_out)
-            model.step(LR)
-            
-            total_loss += loss.item()
-            
-        # Validation (Sampled to save time)
-        val_steps = 10 
+            model.backward(-(by/out - (1-by)/(1-out))/BATCH_SIZE)
+            model.step(lr)
+            loss_sum += loss.item()
+
+        avg_loss = loss_sum / steps
+        history['loss'].append(avg_loss)
+
+        # --- 验证阶段 (augment=False) ---
+        # 严格禁止验证集增强，保证指标公平性
         val_preds, val_targets = [], []
-        
-        for _ in range(val_steps):
-            # 验证集也用 balanced batch 来查看 F1 能力
-            bx, by = get_balanced_batch_cnn(val_paths, txt_dir, BATCH_SIZE)
-            with torch.no_grad(): # Manual no grad logic implies just dont call backward
+        for _ in range(20): # 抽样验证
+            bx, by = val_loader.get_batch(BATCH_SIZE, augment=False) # 关闭增强
+            with torch.no_grad():
                 out = model.forward(bx)
                 val_preds.extend(out.cpu().numpy().flatten())
                 val_targets.extend(by.cpu().numpy().flatten())
-                
-        val_preds = np.array(val_preds)
-        val_targets = np.array(val_targets)
         
-        # 寻找最佳阈值
+        # 找最佳阈值
+        vp, vt = np.array(val_preds), np.array(val_targets)
         cur_best_f1 = 0
-        best_thresh = 0.5
+        cur_p, cur_r = 0, 0
+        best_t = 0.5
+        
         for t in np.arange(0.1, 0.9, 0.05):
-            p_bin = (val_preds > t).astype(float)
-            f1 = f1_score(val_targets, p_bin)
-            if f1 > cur_best_f1:
-                cur_best_f1 = f1
-                best_thresh = t
+            preds = (vp > t).astype(int)
+            s = f1_score(vt, preds, zero_division=0)
+            if s > cur_best_f1:
+                cur_best_f1 = s
+                best_t = t
+                cur_p = precision_score(vt, preds, zero_division=0)
+                cur_r = recall_score(vt, preds, zero_division=0)
         
-        print(f"Epoch {epoch+1} | Loss: {total_loss/steps:.4f} | Val F1: {cur_best_f1:.4f} @ {best_thresh:.2f}")
-        
+        history['val_f1'].append(cur_best_f1)
+        history['val_precision'].append(cur_p)
+        history['val_recall'].append(cur_r)
+
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val F1: {cur_best_f1:.4f} (P:{cur_p:.2f} R:{cur_r:.2f}) | LR: {lr:.5f}")
+
+        # 策略更新
         if cur_best_f1 > best_f1:
-            best_f1 = cur_best_f1
+            best_f1, pat_cnt, lr_cnt = cur_best_f1, 0, 0
             model.save('model_cnn.pth')
-            print("  >>> Model Saved")
+            print(f"  >>> Best Saved: {best_f1:.4f}")
+        else:
+            pat_cnt += 1; lr_cnt += 1
+            if lr_cnt >= lr_pat: lr *= 0.5; lr_cnt = 0; print(f"  vvv LR Decay: {lr}")
+            if pat_cnt >= patience: print("Early Stop"); break
+
+    # --- 绘图 ---
+    print("Generating plots...")
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['loss'], label='Training Loss', color='red')
+    plt.savefig('training_loss.png')
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['val_f1'], label='Val F1', color='blue')
+    plt.plot(history['val_precision'], label='Precision', linestyle='--')
+    plt.plot(history['val_recall'], label='Recall', linestyle='--')
+    plt.legend()
+    plt.savefig('validation_metrics.png')
+    print("Plots saved.")
 
 if __name__ == '__main__':
     train()
