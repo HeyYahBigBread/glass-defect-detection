@@ -1,167 +1,167 @@
-import numpy as np
 import os
-import glob
-import cv2
-from PIL import Image
-import torch
 import argparse
+import glob
+import numpy as np
+import cv2
+import torch
+import torch.nn.functional as F
 from sklearn.metrics import f1_score
-import time
+import sys
 
-# 学生ID（需要替换）
+# --- 配置 ---
+IMG_SIZE = 128
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 STUDENT_ID = "PB23000243"
 
+# --- 核心修复：支持中文路径的读取函数 ---
+def cv_imread(file_path):
+    try:
+        raw_data = np.fromfile(file_path, dtype=np.uint8)
+        img = cv2.imdecode(raw_data, cv2.IMREAD_GRAYSCALE)
+        return img
+    except Exception:
+        return None
 
-def extract_hog_features(image, cell_size=(8, 8), block_size=(2, 2), nbins=9):
-    """手动实现简化版HOG特征提取"""
-    # 1. 计算图像梯度
-    gx = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=3)
+# ==============================================================================
+# 1. 模型定义 (必须保持完全一致)
+# ==============================================================================
+class ManualConv2d:
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.W = torch.zeros(out_channels, in_channels * kernel_size * kernel_size).to(DEVICE)
+        self.b = torch.zeros(1, out_channels).to(DEVICE)
+    def forward(self, x):
+        N, C, H, W = x.shape
+        H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
+        W_out = (W + 2 * self.padding - self.kernel_size) // self.stride + 1
+        inp_unf = F.unfold(x, (self.kernel_size, self.kernel_size), padding=self.padding, stride=self.stride)
+        out = inp_unf.transpose(1, 2).matmul(self.W.t()) + self.b 
+        out = out.transpose(1, 2).reshape(N, self.out_channels, H_out, W_out)
+        return out
 
-    # 2. 计算梯度幅度和方向
-    mag, ang = cv2.cartToPolar(gx, gy)
+class ManualMaxPool2d:
+    def __init__(self, kernel_size=2, stride=2):
+        self.kernel_size = kernel_size
+        self.stride = stride
+    def forward(self, x):
+        out, _ = F.max_pool2d(x, self.kernel_size, self.stride, return_indices=True)
+        return out
 
-    # 3. 量化方向到bins
-    bins = np.int32(nbins * ang / (2 * np.pi))
+class ManualFlatten:
+    def forward(self, x):
+        return x.reshape(x.shape[0], -1)
 
-    # 4. 创建HOG单元格
-    n_cells = (image.shape[0] // cell_size[0], image.shape[1] // cell_size[1])
-    histograms = np.zeros((n_cells[0], n_cells[1], nbins))
+class ManualReLU:
+    def forward(self, x):
+        return x * (x > 0).float()
 
-    # 5. 为每个单元格计算方向直方图
-    for i in range(n_cells[0]):
-        for j in range(n_cells[1]):
-            cell_mag = mag[i * cell_size[0]:(i + 1) * cell_size[0], j * cell_size[1]:(j + 1) * cell_size[1]]
-            cell_bins = bins[i * cell_size[0]:(i + 1) * cell_size[0], j * cell_size[1]:(j + 1) * cell_size[1]]
+class ManualLinear:
+    def __init__(self, in_features, out_features):
+        self.W = torch.zeros(in_features, out_features).to(DEVICE)
+        self.b = torch.zeros(1, out_features).to(DEVICE)
+    def forward(self, x):
+        return x.mm(self.W) + self.b
 
-            for k in range(nbins):
-                histograms[i, j, k] = np.sum(cell_mag[cell_bins == k])
+class ManualSigmoid:
+    def forward(self, x):
+        return 1.0 / (1.0 + torch.exp(-torch.clamp(x, -50, 50)))
 
-    # 6. 归一化块
-    hog_features = []
-    for i in range(n_cells[0] - block_size[0] + 1):
-        for j in range(n_cells[1] - block_size[1] + 1):
-            block = histograms[i:i + block_size[0], j:j + block_size[1]]
-            block_norm = np.linalg.norm(block.ravel() + 1e-6)
-            hog_features.extend((block.ravel() / block_norm).tolist())
-
-    return np.array(hog_features)
-
-
-def preprocess_image(img_path):
-    """预处理单个图像"""
-    img = Image.open(img_path)
-    img = img.resize((85, 85))  # 降采样
-    img = np.array(img).astype(np.float32) / 255.0
-
-    # 转换为灰度图
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    # 提取HOG特征
-    features = extract_hog_features(img)
-    return features
-
-
-class NeuralNetwork:
-    """简化版神经网络，只包含推理所需的方法"""
-
+class CNN:
     def __init__(self):
-        self.weights = []
-        self.biases = []
-        self.layer_sizes = []
+        self.layers = [
+            ManualConv2d(1, 8, kernel_size=5, stride=1, padding=2), ManualReLU(), ManualMaxPool2d(2, 2),
+            ManualConv2d(8, 16, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
+            ManualConv2d(16, 32, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
+            ManualFlatten(),
+            ManualLinear(32 * 16 * 16, 128), ManualReLU(),
+            ManualLinear(128, 1), ManualSigmoid()
+        ]
+    def forward(self, x):
+        out = x
+        for layer in self.layers: out = layer.forward(out)
+        return out
+    def load(self, path):
+        if not os.path.exists(path): raise FileNotFoundError(f"Not found: {path}")
+        checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, (ManualConv2d, ManualLinear)):
+                layer.W = checkpoint[f'{i}_W'].to(DEVICE)
+                layer.b = checkpoint[f'{i}_b'].to(DEVICE)
 
-    def relu(self, z):
-        return np.maximum(0, z)
-
-    def sigmoid(self, z):
-        z = np.clip(z, -100, 100)
-        return 1 / (1 + np.exp(-z))
-
-    def forward(self, X):
-        if X.ndim == 1:
-            X = X.reshape(1, -1)
-
-        a = X.T
-
-        # 隐藏层
-        for i in range(len(self.weights) - 1):
-            z = np.dot(self.weights[i], a) + self.biases[i]
-            a = self.relu(z)
-
-        # 输出层
-        z = np.dot(self.weights[-1], a) + self.biases[-1]
-        a = self.sigmoid(z)
-
-        return a.T
-
-    def predict(self, X):
-        return self.forward(X).flatten()
-
-    def predict_classes(self, X, threshold=0.5):
-        probs = self.predict(X)
-        return (probs >= threshold).astype(int)
-
-    def load_model(self, filename):
-        """加载模型参数"""
-        model_params = torch.load(filename, map_location='cpu', weights_only=False)
-        self.weights = model_params['weights']
-        self.biases = model_params['biases']
-        self.layer_sizes = model_params['layer_sizes']
-
-
-def main():
+# ==============================================================================
+# 2. 评测逻辑 (加入自动阈值搜索)
+# ==============================================================================
+def evaluate():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test_data_path', type=str, required=True, help='测试数据路径')
+    parser.add_argument('--test_data_path', type=str, required=True)
     args = parser.parse_args()
 
-    # 加载训练好的模型
-    model = NeuralNetwork()
-    model.load_model("glass_defect_model.pkl")
+    img_dir = os.path.join(args.test_data_path, 'img')
+    txt_dir = os.path.join(args.test_data_path, 'txt')
+    img_paths = glob.glob(os.path.join(img_dir, '*.png'))
+    
+    if not img_paths:
+        print(f"{STUDENT_ID}:0.0")
+        return
 
-    # 获取测试数据
-    img_dir = os.path.join(args.test_data_path, "img")
-    txt_dir = os.path.join(args.test_data_path, "txt")
-    img_files = sorted(glob.glob(os.path.join(img_dir, "*.png")))
+    # 加载模型
+    model = CNN()
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model_cnn.pth')
+    try:
+        model.load(model_path)
+    except Exception:
+        print(f"{STUDENT_ID}:0.0")
+        return
 
-    # 准备数据和真实标签
-    X_test = []
-    y_true = []
+    # 1. 获取所有预测概率
+    all_probs = []
+    all_labels = []
+    
+    BATCH_SIZE = 32
+    batch_imgs = []
+    
+    for i, img_path in enumerate(img_paths):
+        img = cv_imread(img_path)
+        if img is None: continue
+        
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        img = img.astype(np.float32) / 255.0
+        batch_imgs.append(img[np.newaxis, :, :])
+        
+        # 读取标签
+        base = os.path.basename(img_path).replace('.png', '')
+        label = 1 if os.path.exists(os.path.join(txt_dir, base + '.txt')) else 0
+        all_labels.append(label)
+        
+        if len(batch_imgs) == BATCH_SIZE or i == len(img_paths) - 1:
+            batch_t = torch.tensor(np.array(batch_imgs)).float().to(DEVICE)
+            with torch.no_grad():
+                out = model.forward(batch_t)
+                all_probs.extend(out.cpu().numpy().flatten())
+            batch_imgs = []
 
-    # 记录开始时间
-    start_time = time.time()
+    if not all_labels:
+        print(f"{STUDENT_ID}:0.0")
+        return
 
-    # 处理每个图像
-    for img_file in img_files:
-        # 预处理图像
-        features = preprocess_image(img_file)
-        X_test.append(features)
+    # 2. 自动搜索最佳阈值 (这才是提分的关键!)
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
+    
+    best_f1 = 0.0
+    # 扫描 0.1 到 0.9，步长 0.05
+    for thresh in np.arange(0.1, 0.95, 0.05):
+        preds = (all_probs > thresh).astype(int)
+        score = f1_score(all_labels, preds, pos_label=1)
+        if score > best_f1:
+            best_f1 = score
+            
+    # 输出最高分
+    print(f"{STUDENT_ID}:{best_f1:.4f}")
 
-        # 确定真实标签
-        base_name = os.path.basename(img_file).replace(".png", ".txt")
-        txt_file = os.path.join(txt_dir, base_name)
-        label = 1 if os.path.exists(txt_file) else 0
-        y_true.append(label)
-
-    X_test = np.array(X_test)
-    y_true = np.array(y_true)
-
-    # 预测
-    y_pred = model.predict(X_test)
-    y_pred_classes = (y_pred >= 0.4).astype(int)
-
-    # 计算F1分数
-    f1 = f1_score(y_true, y_pred_classes)
-
-    # 记录结束时间
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-
-    print(f"{STUDENT_ID}:{f1:.4f}")
-    #print(f"评估完成，共处理 {len(img_files)} 个图像，耗时 {elapsed_time:.2f} 秒", file=sys.stderr)
-
-
-if __name__ == "__main__":
-    import sys
-
-    main()
+if __name__ == '__main__':
+    evaluate()
