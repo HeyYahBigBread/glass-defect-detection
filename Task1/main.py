@@ -137,16 +137,19 @@ class ManualSigmoid:
 class CNN:
     def __init__(self):
         self.layers = [
-            # Conv1: 1 -> 8
-            ManualConv2d(1, 8, kernel_size=5, stride=1, padding=2), ManualReLU(), ManualMaxPool2d(2, 2),
-            # Conv2: 8 -> 16
-            ManualConv2d(8, 16, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
-            # Conv3: 16 -> 32
-            ManualConv2d(16, 32, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 1: 1 -> 16
+            ManualConv2d(1, 16, 5, 1, 2), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 2: 16 -> 32
+            ManualConv2d(16, 32, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 3: 32 -> 64
+            ManualConv2d(32, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 4: 64 -> 64 (新增一层)
+            ManualConv2d(64, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
             
             ManualFlatten(),
-            # Linear: 32 * 16 * 16 = 8192 (For 128x128 input)
-            ManualLinear(32 * 16 * 16, 128), ManualReLU(),
+            # Linear输入维度: 128经过4次池化变成8 (128->64->32->16->8)
+            # 所以是 64通道 * 8 * 8
+            ManualLinear(64 * 8 * 8, 128), ManualReLU(),
             ManualLinear(128, 1), ManualSigmoid()
         ]
 
@@ -255,105 +258,132 @@ def train():
     parser.add_argument('--data_path', type=str, default='../dataset/train')
     args = parser.parse_args()
     
-    # 路径检查
     img_dir = os.path.join(args.data_path, 'img')
     txt_dir = os.path.join(args.data_path, 'txt')
     all_paths = glob.glob(os.path.join(img_dir, '*.png'))
-    if not all_paths: print("Error: No images found!"); return
+    if not all_paths: print("No images!"); return
 
-    # --- 1. 严格切分数据集 (先切分，再给 Loader) ---
-    np.random.shuffle(all_paths) # 打乱顺序
+    # 1. 物理切分
+    np.random.seed(42)
+    np.random.shuffle(all_paths)
     split = int(0.8 * len(all_paths))
     train_paths = all_paths[:split]
     val_paths = all_paths[split:]
-    
-    print(f"Total images: {len(all_paths)}. Split: {len(train_paths)} Train, {len(val_paths)} Val.")
 
-    # --- 2. 初始化完全独立的 Loader ---
-    train_loader = GlassDataLoader(train_paths, txt_dir, name="Train")
-    val_loader = GlassDataLoader(val_paths, txt_dir, name="Val")
-    
+    # 2. 初始化 Loader
+    train_loader = GlassDataLoader(train_paths, txt_dir, name="Train-Aug") # 训练用：带增强
+    val_loader = GlassDataLoader(val_paths, txt_dir, name="Val")           # 验证用
+    # 【新增】训练集评估器：复用验证集的逻辑（无增强、顺序读取），用于画真实的训练曲线
+    train_eval_loader = GlassDataLoader(train_paths, txt_dir, name="Train-Eval") 
+
     model = CNN()
-    print(f"Start Training (Safe Split & Augmentation) on {DEVICE}...")
+    print(f"Start Training on {DEVICE}...")
     
-    # 策略参数
     best_f1 = 0.0
     patience, pat_cnt = 8, 0
     lr, lr_pat, lr_cnt = LR, 3, 0
     
-    history = {'loss': [], 'val_f1': [], 'val_precision': [], 'val_recall': []}
-    
+    # 记录 Loss 和 0.5 阈值下的 P/R/F1
+    history = {
+        'loss': [], 
+        'train_f1': [], 'train_p': [], 'train_r': [],
+        'val_f1': [], 'val_p': [], 'val_r': []
+    }
+
     for epoch in range(EPOCHS):
-        # --- 训练阶段 (augment=True) ---
+        # --- A. 训练阶段 ---
         steps = len(train_paths) // BATCH_SIZE
         loss_sum = 0
         for _ in range(steps):
-            bx, by = train_loader.get_batch(BATCH_SIZE, augment=True) # 开启增强
+            bx, by = train_loader.get_batch(BATCH_SIZE, augment=True)
             out = model.forward(bx)
             out = torch.clamp(out, 1e-7, 1-1e-7)
             loss = -(by * torch.log(out) + (1-by) * torch.log(1-out)).mean()
-            
             model.backward(-(by/out - (1-by)/(1-out))/BATCH_SIZE)
             model.step(lr)
             loss_sum += loss.item()
-
+        
         avg_loss = loss_sum / steps
         history['loss'].append(avg_loss)
 
-        # --- 验证阶段 (augment=False) ---
-        # 严格禁止验证集增强，保证指标公平性
+        # --- B. 验证阶段 ---
         val_preds, val_targets = [], []
-        for _ in range(20): # 抽样验证
-            bx, by = val_loader.get_batch(BATCH_SIZE, augment=False) # 关闭增强
+        # 抽样验证 30个 batch (约1000张图)，节省时间且足够准确
+        for _ in range(30):
+            bx, by = val_loader.get_batch(BATCH_SIZE, augment=False)
             with torch.no_grad():
                 out = model.forward(bx)
                 val_preds.extend(out.cpu().numpy().flatten())
                 val_targets.extend(by.cpu().numpy().flatten())
         
-        # 找最佳阈值
         vp, vt = np.array(val_preds), np.array(val_targets)
-        cur_best_f1 = 0
-        cur_p, cur_r = 0, 0
-        best_t = 0.5
-        
-        for t in np.arange(0.1, 0.9, 0.05):
-            preds = (vp > t).astype(int)
-            s = f1_score(vt, preds, zero_division=0)
-            if s > cur_best_f1:
-                cur_best_f1 = s
-                best_t = t
-                cur_p = precision_score(vt, preds, zero_division=0)
-                cur_r = recall_score(vt, preds, zero_division=0)
-        
-        history['val_f1'].append(cur_best_f1)
-        history['val_precision'].append(cur_p)
-        history['val_recall'].append(cur_r)
 
-        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val F1: {cur_best_f1:.4f} (P:{cur_p:.2f} R:{cur_r:.2f}) | LR: {lr:.5f}")
+        # 【逻辑分离 1】作图指标：强制使用 0.5 阈值 (曲线更平滑)
+        p05 = (vp > 0.5).astype(int)
+        history['val_f1'].append(f1_score(vt, p05, zero_division=0))
+        history['val_p'].append(precision_score(vt, p05, zero_division=0))
+        history['val_r'].append(recall_score(vt, p05, zero_division=0))
 
-        # 策略更新
-        if cur_best_f1 > best_f1:
-            best_f1, pat_cnt, lr_cnt = cur_best_f1, 0, 0
+        # 【逻辑分离 2】保存指标：搜索最佳阈值 (寻找模型潜力)
+        val_best_f1 = 0.0
+        for t in np.arange(0.1, 0.95, 0.05):
+            s = f1_score(vt, (vp > t).astype(int), zero_division=0)
+            if s > val_best_f1: val_best_f1 = s
+
+        # --- C. 训练集评估 (新增) ---
+        train_preds, train_targets = [], []
+        # 抽样评估 30个 batch
+        for _ in range(30):
+            bx, by = train_eval_loader.get_batch(BATCH_SIZE, augment=False) # 无增强
+            with torch.no_grad():
+                out = model.forward(bx)
+                train_preds.extend(out.cpu().numpy().flatten())
+                train_targets.extend(by.cpu().numpy().flatten())
+        
+        tp, tt = np.array(train_preds), np.array(train_targets)
+        # 训练集作图也强制用 0.5
+        tp05 = (tp > 0.5).astype(int)
+        history['train_f1'].append(f1_score(tt, tp05, zero_division=0))
+        history['train_p'].append(precision_score(tt, tp05, zero_division=0))
+        history['train_r'].append(recall_score(tt, tp05, zero_division=0))
+
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val F1(0.5): {history['val_f1'][-1]:.4f} | Best Potential: {val_best_f1:.4f} | LR: {lr:.5f}")
+
+        # --- D. 策略更新 (用“最佳潜力”决定是否保存) ---
+        if val_best_f1 > best_f1:
+            best_f1, pat_cnt, lr_cnt = val_best_f1, 0, 0
             model.save('model_cnn.pth')
-            print(f"  >>> Best Saved: {best_f1:.4f}")
+            print(f"  >>> Best Model Saved (Potential: {best_f1:.4f})")
         else:
             pat_cnt += 1; lr_cnt += 1
             if lr_cnt >= lr_pat: lr *= 0.5; lr_cnt = 0; print(f"  vvv LR Decay: {lr}")
             if pat_cnt >= patience: print("Early Stop"); break
 
-    # --- 绘图 ---
-    print("Generating plots...")
-    plt.figure(figsize=(10, 5))
-    plt.plot(history['loss'], label='Training Loss', color='red')
-    plt.savefig('training_loss.png')
+    # --- E. 绘图 (生成包含训练集指标的完整图表) ---
+    print("Generating report plots...")
+    epochs_range = range(1, len(history['loss']) + 1)
+    plt.figure(figsize=(18, 5))
     
-    plt.figure(figsize=(10, 5))
-    plt.plot(history['val_f1'], label='Val F1', color='blue')
-    plt.plot(history['val_precision'], label='Precision', linestyle='--')
-    plt.plot(history['val_recall'], label='Recall', linestyle='--')
-    plt.legend()
-    plt.savefig('validation_metrics.png')
-    print("Plots saved.")
+    # 1. Loss
+    plt.subplot(1, 3, 1); plt.title('Loss')
+    plt.plot(epochs_range, history['loss'], 'r-')
+    
+    # 2. Train Metrics (0.5 threshold)
+    plt.subplot(1, 3, 2); plt.title('Train Metrics (Thresh=0.5)')
+    plt.plot(epochs_range, history['train_f1'], label='F1')
+    plt.plot(epochs_range, history['train_p'], '--', label='Precision')
+    plt.plot(epochs_range, history['train_r'], '--', label='Recall')
+    plt.legend(); plt.ylim(0, 1.05)
+
+    # 3. Val Metrics (0.5 threshold)
+    plt.subplot(1, 3, 3); plt.title('Val Metrics (Thresh=0.5)')
+    plt.plot(epochs_range, history['val_f1'], label='F1')
+    plt.plot(epochs_range, history['val_p'], '--', label='Precision')
+    plt.plot(epochs_range, history['val_r'], '--', label='Recall')
+    plt.legend(); plt.ylim(0, 1.05)
+
+    plt.savefig('report_plots.png')
+    print("Saved report_plots.png")
 
 if __name__ == '__main__':
     train()

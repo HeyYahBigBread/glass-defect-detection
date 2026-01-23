@@ -11,7 +11,7 @@ import sys
 # --- 配置 ---
 IMG_SIZE = 128
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-STUDENT_ID = "PB23000243"
+STUDENT_ID = "PB23000000"  # TODO: 务必修改为你的真实学号
 
 # --- 核心修复：支持中文路径的读取函数 ---
 def cv_imread(file_path):
@@ -53,7 +53,12 @@ class ManualMaxPool2d:
 
 class ManualFlatten:
     def forward(self, x):
-        return x.reshape(x.shape[0], -1)
+        self.input_shape = x.shape  # 关键：记下输入的形状
+        return x.reshape(x.shape[0], -1) 
+
+    def backward(self, grad_output):
+        # 使用记下的形状来还原，解决报错
+        return grad_output.reshape(self.input_shape)
 
 class ManualReLU:
     def forward(self, x):
@@ -73,24 +78,46 @@ class ManualSigmoid:
 class CNN:
     def __init__(self):
         self.layers = [
-            ManualConv2d(1, 8, kernel_size=5, stride=1, padding=2), ManualReLU(), ManualMaxPool2d(2, 2),
-            ManualConv2d(8, 16, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
-            ManualConv2d(16, 32, kernel_size=3, stride=1, padding=1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 1: 1 -> 16
+            ManualConv2d(1, 16, 5, 1, 2), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 2: 16 -> 32
+            ManualConv2d(16, 32, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 3: 32 -> 64
+            ManualConv2d(32, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
+            # Layer 4: 64 -> 64 (新增一层)
+            ManualConv2d(64, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
+            
             ManualFlatten(),
-            ManualLinear(32 * 16 * 16, 128), ManualReLU(),
+            # Linear输入维度: 128经过4次池化(每次减半)变成8 (128->64->32->16->8)
+            # 所以是 64通道 * 8 * 8
+            ManualLinear(64 * 8 * 8, 128), ManualReLU(),
             ManualLinear(128, 1), ManualSigmoid()
         ]
+
     def forward(self, x):
         out = x
         for layer in self.layers: out = layer.forward(out)
         return out
-    def load(self, path):
-        if not os.path.exists(path): raise FileNotFoundError(f"Not found: {path}")
-        checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+    def backward(self, grad_loss):
+        grad = grad_loss
+        for layer in reversed(self.layers): grad = layer.backward(grad)
+    def step(self, lr):
+        for layer in self.layers: 
+            if hasattr(layer, 'step'): layer.step(lr)
+    def save(self, path):
+        checkpoint = {}
         for i, layer in enumerate(self.layers):
             if isinstance(layer, (ManualConv2d, ManualLinear)):
-                layer.W = checkpoint[f'{i}_W'].to(DEVICE)
-                layer.b = checkpoint[f'{i}_b'].to(DEVICE)
+                checkpoint[f'{i}_W'] = layer.W.cpu(); checkpoint[f'{i}_b'] = layer.b.cpu()
+        torch.save(checkpoint, path)
+    def load(self, path):
+        # 增加 weights_only=True 提高安全性
+        checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, (ManualConv2d, ManualLinear)):
+                if f'{i}_W' in checkpoint: # 兼容性检查
+                    layer.W = checkpoint[f'{i}_W'].to(DEVICE)
+                    layer.b = checkpoint[f'{i}_b'].to(DEVICE)
 
 # ==============================================================================
 # 2. 评测逻辑 (加入自动阈值搜索)
