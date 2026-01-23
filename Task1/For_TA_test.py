@@ -8,12 +8,11 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score
 import sys
 
-# --- 配置 ---
+
 IMG_SIZE = 128
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-STUDENT_ID = "PB23000000"  # TODO: 务必修改为你的真实学号
+STUDENT_ID = "PB23111669"  
 
-# --- 核心修复：支持中文路径的读取函数 ---
 def cv_imread(file_path):
     try:
         raw_data = np.fromfile(file_path, dtype=np.uint8)
@@ -22,9 +21,7 @@ def cv_imread(file_path):
     except Exception:
         return None
 
-# ==============================================================================
-# 1. 模型定义 (必须保持完全一致)
-# ==============================================================================
+
 class ManualConv2d:
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         self.in_channels = in_channels
@@ -53,11 +50,11 @@ class ManualMaxPool2d:
 
 class ManualFlatten:
     def forward(self, x):
-        self.input_shape = x.shape  # 关键：记下输入的形状
+        self.input_shape = x.shape 
         return x.reshape(x.shape[0], -1) 
 
     def backward(self, grad_output):
-        # 使用记下的形状来还原，解决报错
+
         return grad_output.reshape(self.input_shape)
 
 class ManualReLU:
@@ -88,8 +85,7 @@ class CNN:
             ManualConv2d(64, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
             
             ManualFlatten(),
-            # Linear输入维度: 128经过4次池化(每次减半)变成8 (128->64->32->16->8)
-            # 所以是 64通道 * 8 * 8
+
             ManualLinear(64 * 8 * 8, 128), ManualReLU(),
             ManualLinear(128, 1), ManualSigmoid()
         ]
@@ -111,7 +107,7 @@ class CNN:
                 checkpoint[f'{i}_W'] = layer.W.cpu(); checkpoint[f'{i}_b'] = layer.b.cpu()
         torch.save(checkpoint, path)
     def load(self, path):
-        # 增加 weights_only=True 提高安全性
+
         checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
         for i, layer in enumerate(self.layers):
             if isinstance(layer, (ManualConv2d, ManualLinear)):
@@ -119,9 +115,7 @@ class CNN:
                     layer.W = checkpoint[f'{i}_W'].to(DEVICE)
                     layer.b = checkpoint[f'{i}_b'].to(DEVICE)
 
-# ==============================================================================
-# 2. 评测逻辑 (加入自动阈值搜索)
-# ==============================================================================
+
 def evaluate():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_data_path', type=str, required=True)
@@ -135,7 +129,6 @@ def evaluate():
         print(f"{STUDENT_ID}:0.0")
         return
 
-    # 加载模型
     model = CNN()
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model_cnn.pth')
     try:
@@ -144,7 +137,7 @@ def evaluate():
         print(f"{STUDENT_ID}:0.0")
         return
 
-    # 1. 获取所有预测概率
+
     all_probs = []
     all_labels = []
     
@@ -159,7 +152,7 @@ def evaluate():
         img = img.astype(np.float32) / 255.0
         batch_imgs.append(img[np.newaxis, :, :])
         
-        # 读取标签
+
         base = os.path.basename(img_path).replace('.png', '')
         label = 1 if os.path.exists(os.path.join(txt_dir, base + '.txt')) else 0
         all_labels.append(label)
@@ -175,12 +168,11 @@ def evaluate():
         print(f"{STUDENT_ID}:0.0")
         return
 
-    # 2. 自动搜索最佳阈值 (这才是提分的关键!)
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
     
     best_f1 = 0.0
-    # 扫描 0.1 到 0.9，步长 0.05
+
     for thresh in np.arange(0.1, 0.95, 0.05):
         preds = (all_probs > thresh).astype(int)
         score = f1_score(all_labels, preds, pos_label=1)

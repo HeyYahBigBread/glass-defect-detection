@@ -8,16 +8,14 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, precision_score, recall_score
 
-# --- 配置 ---
-IMG_SIZE = 128   # 保持128平衡速度与精度
+
+IMG_SIZE = 128   
 BATCH_SIZE = 32
 LR = 0.001
 EPOCHS = 50
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ==============================================================================
-# 1. 基础算子 (无 Autograd)
-# ==============================================================================
+
 class ManualConv2d:
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         self.in_channels = in_channels
@@ -131,9 +129,7 @@ class ManualSigmoid:
     def backward(self, grad_output):
         return grad_output * self.out * (1.0 - self.out)
 
-# ==============================================================================
-# 2. 轻量级 CNN (3层卷积)
-# ==============================================================================
+
 class CNN:
     def __init__(self):
         self.layers = [
@@ -147,8 +143,7 @@ class CNN:
             ManualConv2d(64, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
             
             ManualFlatten(),
-            # Linear输入维度: 128经过4次池化变成8 (128->64->32->16->8)
-            # 所以是 64通道 * 8 * 8
+
             ManualLinear(64 * 8 * 8, 128), ManualReLU(),
             ManualLinear(128, 1), ManualSigmoid()
         ]
@@ -175,14 +170,9 @@ class CNN:
             if isinstance(layer, (ManualConv2d, ManualLinear)):
                 layer.W = checkpoint[f'{i}_W'].to(DEVICE); layer.b = checkpoint[f'{i}_b'].to(DEVICE)
 
-# ==============================================================================
-# 3. 安全的数据加载器 (Class-based, Zero Leakage)
-# ==============================================================================
 class GlassDataLoader:
     def __init__(self, img_paths, txt_dir, name="Loader"):
-        """
-        初始化时就完成数据扫描和分类，保证训练集和验证集互不干扰。
-        """
+
         self.name = name
         self.pos_paths = []
         self.neg_paths = []
@@ -198,18 +188,10 @@ class GlassDataLoader:
         print(f"[{self.name}] Stats: {len(self.pos_paths)} Defective, {len(self.neg_paths)} Good")
 
     def get_batch(self, batch_size, augment=False):
-        """
-        获取一个平衡采样的 Batch。
-        augment=True: 训练模式，启用随机翻转/旋转
-        augment=False: 验证模式，禁用增强，只做缩放和归一化
-        """
-        # 平衡采样: 50% 正样本, 50% 负样本
+
         n_pos = batch_size // 2
         n_neg = batch_size - n_pos
-        
-        # 随机抽取路径
-        # 注意：如果是验证集，这里虽然是随机抽，但因为augment=False，
-        # 我们评估的是模型对这批样本的“原始形态”的判断能力，这是合理的。
+
         pos_batch = np.random.choice(self.pos_paths, n_pos)
         neg_batch = np.random.choice(self.neg_paths, n_neg)
         batch_paths = np.concatenate([pos_batch, neg_batch])
@@ -217,13 +199,13 @@ class GlassDataLoader:
 
         images, labels = [], []
         for p in batch_paths:
-            # 读取
+
             raw = np.fromfile(p, dtype=np.uint8)
             img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
             img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
             img = img.astype(np.float32) / 255.0
             
-            # --- 数据增强 (仅当 augment=True 时触发) ---
+            # 数据增强 (仅当 augment=True 时触发) 
             if augment:
                 # 随机水平翻转
                 if np.random.rand() > 0.5:
@@ -238,10 +220,7 @@ class GlassDataLoader:
             
             # 解决内存不连续警告
             images.append(img[np.newaxis, :, :].copy()) 
-            
-            # 标签
-            # 实际上我们在init里已经分好类了，可以直接判断 p 在不在 pos_paths 里，
-            # 但为了简单，这里复用路径判断
+
             if p in self.pos_paths:
                 labels.append(1.0)
             else:
@@ -250,9 +229,7 @@ class GlassDataLoader:
         return torch.tensor(np.array(images)).float().to(DEVICE), \
                torch.tensor(np.array(labels)).float().view(-1, 1).to(DEVICE)
 
-# ==============================================================================
-# 4. 训练循环 (含绘图)
-# ==============================================================================
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='../dataset/train')
@@ -263,17 +240,16 @@ def train():
     all_paths = glob.glob(os.path.join(img_dir, '*.png'))
     if not all_paths: print("No images!"); return
 
-    # 1. 物理切分
+
     np.random.seed(42)
     np.random.shuffle(all_paths)
     split = int(0.8 * len(all_paths))
     train_paths = all_paths[:split]
     val_paths = all_paths[split:]
 
-    # 2. 初始化 Loader
-    train_loader = GlassDataLoader(train_paths, txt_dir, name="Train-Aug") # 训练用：带增强
-    val_loader = GlassDataLoader(val_paths, txt_dir, name="Val")           # 验证用
-    # 【新增】训练集评估器：复用验证集的逻辑（无增强、顺序读取），用于画真实的训练曲线
+    train_loader = GlassDataLoader(train_paths, txt_dir, name="Train-Aug") 
+    val_loader = GlassDataLoader(val_paths, txt_dir, name="Val")           
+
     train_eval_loader = GlassDataLoader(train_paths, txt_dir, name="Train-Eval") 
 
     model = CNN()
@@ -283,7 +259,7 @@ def train():
     patience, pat_cnt = 8, 0
     lr, lr_pat, lr_cnt = LR, 3, 0
     
-    # 记录 Loss 和 0.5 阈值下的 P/R/F1
+
     history = {
         'loss': [], 
         'train_f1': [], 'train_p': [], 'train_r': [],
@@ -291,7 +267,7 @@ def train():
     }
 
     for epoch in range(EPOCHS):
-        # --- A. 训练阶段 ---
+
         steps = len(train_paths) // BATCH_SIZE
         loss_sum = 0
         for _ in range(steps):
@@ -306,9 +282,9 @@ def train():
         avg_loss = loss_sum / steps
         history['loss'].append(avg_loss)
 
-        # --- B. 验证阶段 ---
+        
         val_preds, val_targets = [], []
-        # 抽样验证 30个 batch (约1000张图)，节省时间且足够准确
+
         for _ in range(30):
             bx, by = val_loader.get_batch(BATCH_SIZE, augment=False)
             with torch.no_grad():
@@ -318,30 +294,30 @@ def train():
         
         vp, vt = np.array(val_preds), np.array(val_targets)
 
-        # 【逻辑分离 1】作图指标：强制使用 0.5 阈值 (曲线更平滑)
+        
         p05 = (vp > 0.5).astype(int)
         history['val_f1'].append(f1_score(vt, p05, zero_division=0))
         history['val_p'].append(precision_score(vt, p05, zero_division=0))
         history['val_r'].append(recall_score(vt, p05, zero_division=0))
 
-        # 【逻辑分离 2】保存指标：搜索最佳阈值 (寻找模型潜力)
+
         val_best_f1 = 0.0
         for t in np.arange(0.1, 0.95, 0.05):
             s = f1_score(vt, (vp > t).astype(int), zero_division=0)
             if s > val_best_f1: val_best_f1 = s
 
-        # --- C. 训练集评估 (新增) ---
+
         train_preds, train_targets = [], []
         # 抽样评估 30个 batch
         for _ in range(30):
-            bx, by = train_eval_loader.get_batch(BATCH_SIZE, augment=False) # 无增强
+            bx, by = train_eval_loader.get_batch(BATCH_SIZE, augment=False) 
             with torch.no_grad():
                 out = model.forward(bx)
                 train_preds.extend(out.cpu().numpy().flatten())
                 train_targets.extend(by.cpu().numpy().flatten())
         
         tp, tt = np.array(train_preds), np.array(train_targets)
-        # 训练集作图也强制用 0.5
+
         tp05 = (tp > 0.5).astype(int)
         history['train_f1'].append(f1_score(tt, tp05, zero_division=0))
         history['train_p'].append(precision_score(tt, tp05, zero_division=0))
@@ -349,7 +325,7 @@ def train():
 
         print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val F1(0.5): {history['val_f1'][-1]:.4f} | Best Potential: {val_best_f1:.4f} | LR: {lr:.5f}")
 
-        # --- D. 策略更新 (用“最佳潜力”决定是否保存) ---
+        
         if val_best_f1 > best_f1:
             best_f1, pat_cnt, lr_cnt = val_best_f1, 0, 0
             model.save('model_cnn.pth')
@@ -359,7 +335,6 @@ def train():
             if lr_cnt >= lr_pat: lr *= 0.5; lr_cnt = 0; print(f"  vvv LR Decay: {lr}")
             if pat_cnt >= patience: print("Early Stop"); break
 
-    # --- E. 绘图 (生成包含训练集指标的完整图表) ---
     print("Generating report plots...")
     epochs_range = range(1, len(history['loss']) + 1)
     plt.figure(figsize=(18, 5))
