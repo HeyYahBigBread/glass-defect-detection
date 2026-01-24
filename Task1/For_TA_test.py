@@ -5,14 +5,16 @@ import numpy as np
 import cv2
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import f1_score
+import json
 import sys
 
-
+# --- 配置 ---
 IMG_SIZE = 128
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-STUDENT_ID = "PB23111669"  
+STUDENT_ID = "PB23111669"  # TODO: 务必确认这是你的真实学号
+THRESHOLD = 0.5            # 重要：因为没有标签无法搜索，这里固定为 0.5
 
+# --- 支持中文路径读取 ---
 def cv_imread(file_path):
     try:
         raw_data = np.fromfile(file_path, dtype=np.uint8)
@@ -21,7 +23,9 @@ def cv_imread(file_path):
     except Exception:
         return None
 
-
+# ==============================================================================
+# 1. 模型定义 (必须与 main.py 的 4层结构 完全一致)
+# ==============================================================================
 class ManualConv2d:
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         self.in_channels = in_channels
@@ -29,8 +33,10 @@ class ManualConv2d:
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        # 仅占位，实际参数由 load 加载
         self.W = torch.zeros(out_channels, in_channels * kernel_size * kernel_size).to(DEVICE)
         self.b = torch.zeros(1, out_channels).to(DEVICE)
+
     def forward(self, x):
         N, C, H, W = x.shape
         H_out = (H + 2 * self.padding - self.kernel_size) // self.stride + 1
@@ -50,12 +56,9 @@ class ManualMaxPool2d:
 
 class ManualFlatten:
     def forward(self, x):
-        self.input_shape = x.shape 
+        self.input_shape = x.shape
         return x.reshape(x.shape[0], -1) 
-
-    def backward(self, grad_output):
-
-        return grad_output.reshape(self.input_shape)
+    # Inference 不需要 backward，但为了保持类定义一致性可以留着
 
 class ManualReLU:
     def forward(self, x):
@@ -74,6 +77,7 @@ class ManualSigmoid:
 
 class CNN:
     def __init__(self):
+        # 4层结构，与 main.py 保持一致
         self.layers = [
             # Layer 1: 1 -> 16
             ManualConv2d(1, 16, 5, 1, 2), ManualReLU(), ManualMaxPool2d(2, 2),
@@ -81,11 +85,11 @@ class CNN:
             ManualConv2d(16, 32, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
             # Layer 3: 32 -> 64
             ManualConv2d(32, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
-            # Layer 4: 64 -> 64 (新增一层)
+            # Layer 4: 64 -> 64
             ManualConv2d(64, 64, 3, 1, 1), ManualReLU(), ManualMaxPool2d(2, 2),
             
             ManualFlatten(),
-
+            # Linear输入维度: 64 * 8 * 8
             ManualLinear(64 * 8 * 8, 128), ManualReLU(),
             ManualLinear(128, 1), ManualSigmoid()
         ]
@@ -94,56 +98,57 @@ class CNN:
         out = x
         for layer in self.layers: out = layer.forward(out)
         return out
-    def backward(self, grad_loss):
-        grad = grad_loss
-        for layer in reversed(self.layers): grad = layer.backward(grad)
-    def step(self, lr):
-        for layer in self.layers: 
-            if hasattr(layer, 'step'): layer.step(lr)
-    def save(self, path):
-        checkpoint = {}
-        for i, layer in enumerate(self.layers):
-            if isinstance(layer, (ManualConv2d, ManualLinear)):
-                checkpoint[f'{i}_W'] = layer.W.cpu(); checkpoint[f'{i}_b'] = layer.b.cpu()
-        torch.save(checkpoint, path)
-    def load(self, path):
 
+    def load(self, path):
+        if not os.path.exists(path): raise FileNotFoundError(f"Model file not found: {path}")
+        # weights_only=True 保证安全性
         checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
         for i, layer in enumerate(self.layers):
             if isinstance(layer, (ManualConv2d, ManualLinear)):
-                if f'{i}_W' in checkpoint: # 兼容性检查
+                if f'{i}_W' in checkpoint:
                     layer.W = checkpoint[f'{i}_W'].to(DEVICE)
                     layer.b = checkpoint[f'{i}_b'].to(DEVICE)
 
-
-def evaluate():
+# ==============================================================================
+# 2. 推理逻辑 (生成 JSON)
+# ==============================================================================
+def inference():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_data_path', type=str, required=True)
     args = parser.parse_args()
 
+    # 路径处理
     img_dir = os.path.join(args.test_data_path, 'img')
-    txt_dir = os.path.join(args.test_data_path, 'txt')
-    img_paths = glob.glob(os.path.join(img_dir, '*.png'))
     
+    # 兼容性处理：防止助教直接给的是图片目录而不是根目录
+    if not os.path.exists(img_dir):
+        # 尝试直接在 test_data_path 下找图片
+        img_paths = glob.glob(os.path.join(args.test_data_path, '*.png'))
+    else:
+        img_paths = glob.glob(os.path.join(img_dir, '*.png'))
+        
     if not img_paths:
-        print(f"{STUDENT_ID}:0.0")
+        print(f"No images found in {args.test_data_path}")
         return
 
+    # 加载模型
     model = CNN()
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model_cnn.pth')
+    
     try:
         model.load(model_path)
-    except Exception:
-        print(f"{STUDENT_ID}:0.0")
+    except Exception as e:
+        print(f"Error loading model: {e}")
         return
 
-
-    all_probs = []
-    all_labels = []
+    # 结果字典
+    results = {}
     
     BATCH_SIZE = 32
     batch_imgs = []
+    batch_names = [] # 记录文件名用于 JSON key
     
+    # 开始推理
     for i, img_path in enumerate(img_paths):
         img = cv_imread(img_path)
         if img is None: continue
@@ -152,35 +157,34 @@ def evaluate():
         img = img.astype(np.float32) / 255.0
         batch_imgs.append(img[np.newaxis, :, :])
         
-
-        base = os.path.basename(img_path).replace('.png', '')
-        label = 1 if os.path.exists(os.path.join(txt_dir, base + '.txt')) else 0
-        all_labels.append(label)
+        # 获取文件名 (不含扩展名)
+        file_name = os.path.basename(img_path).replace('.png', '')
+        batch_names.append(file_name)
         
+        # 批处理
         if len(batch_imgs) == BATCH_SIZE or i == len(img_paths) - 1:
             batch_t = torch.tensor(np.array(batch_imgs)).float().to(DEVICE)
+            
             with torch.no_grad():
                 out = model.forward(batch_t)
-                all_probs.extend(out.cpu().numpy().flatten())
-            batch_imgs = []
-
-    if not all_labels:
-        print(f"{STUDENT_ID}:0.0")
-        return
-
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
-    
-    best_f1 = 0.0
-
-    for thresh in np.arange(0.1, 0.95, 0.05):
-        preds = (all_probs > thresh).astype(int)
-        score = f1_score(all_labels, preds, pos_label=1)
-        if score > best_f1:
-            best_f1 = score
+                probs = out.cpu().numpy().flatten()
             
-    # 输出最高分
-    print(f"{STUDENT_ID}:{best_f1:.4f}")
+            # 存入结果
+            for name, prob in zip(batch_names, probs):
+                # JSON 要求 bool 类型: true 表示 defective, false 表示 non-defective
+                # 这里使用 THRESHOLD (0.5) 进行截断
+                is_defective = bool(prob > THRESHOLD)
+                results[name] = is_defective
+                
+            batch_imgs = []
+            batch_names = []
+
+    # 保存 JSON 文件
+    json_filename = f"{STUDENT_ID}.json"
+    with open(json_filename, 'w') as f:
+        json.dump(results, f, indent=4)
+        
+    print(f"Inference done. Results saved to {json_filename}")
 
 if __name__ == '__main__':
-    evaluate()
+    inference()
